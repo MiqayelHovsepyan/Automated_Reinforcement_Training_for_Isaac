@@ -10,9 +10,9 @@ The override file is a JSON dict of dot-path -> value pairs that are applied to 
 agent_cfg at runtime, without modifying source config files.
 
 Usage:
-    python scripts/auto_train/train_with_overrides.py \
+    python .claude/skills/auto_train/resources/train_with_overrides.py \
         --task=Isaac-Velocity-Flat-Ayg-v0 \
-        --overrides-file=experiments/.scratch/phase_0_overrides.json \
+        --overrides-file=.claude/skills/auto_train/experiments/.scratch/phase_0_overrides.json \
         --headless
 """
 
@@ -23,10 +23,12 @@ import sys
 
 from isaaclab.app import AppLauncher
 
-# local imports — cli_args lives in scripts/rsl_rl/, add to path
+# local imports — cli_args lives in scripts/rsl_rl/, compute path from cf_lab root
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "rsl_rl"))
+# Script lives at .claude/skills/auto_train/resources/ — go up 4 levels to cf_lab root
+_cf_lab_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+sys.path.insert(0, os.path.join(_cf_lab_dir, "scripts", "rsl_rl"))
 import cli_args  # isort: skip
 
 # add argparse arguments

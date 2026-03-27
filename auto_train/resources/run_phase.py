@@ -6,13 +6,13 @@
 """Orchestrate a single auto-training phase: train → metrics → play → frames → report.
 
 This script runs as a normal Python process (no Isaac Sim dependency). It launches
-train_with_overrides.py and play.py as subprocesses and coordinates the pipeline.
+train_with_overrides.py and play_for_inspection.py as subprocesses and coordinates the pipeline.
 
 Usage:
-    python scripts/auto_train/run_phase.py \
+    python .claude/skills/auto_train/resources/run_phase.py \
         --task Isaac-Velocity-Spot-Like-Flat-Ayg-v0 \
         --play-task Isaac-Velocity-Spot-Like-Flat-Ayg-Play-v0 \
-        --overrides-file experiments/.scratch/phase_0_overrides.json \
+        --overrides-file .claude/skills/auto_train/experiments/.scratch/phase_0_overrides.json \
         --max-iterations 2000 --num-envs 4096 --headless \
         --monitor-interval 100 --abort-plateau-patience 300
 """
@@ -137,6 +137,104 @@ def check_abort_criteria(metrics: dict, args) -> str | None:
     return None
 
 
+# Regex patterns for parsing RSL-RL training stdout
+_RE_LEARNING_ITER = re.compile(r"Learning iteration (\d+)/(\d+)")
+_RE_MEAN_REWARD = re.compile(r"Mean reward:\s*([-\d.]+)")
+_RE_FPS = re.compile(r"Computation:\s*(\d+)\s*steps/s")
+
+
+def parse_training_line(line: str, progress_state: dict):
+    """Parse a training stdout line and update progress_state in-place."""
+    m = _RE_LEARNING_ITER.search(line)
+    if m:
+        with progress_state["_lock"]:
+            progress_state["current_iteration"] = int(m.group(1))
+            progress_state["max_iterations"] = int(m.group(2))
+    m = _RE_MEAN_REWARD.search(line)
+    if m:
+        with progress_state["_lock"]:
+            progress_state["mean_reward"] = float(m.group(1))
+    m = _RE_FPS.search(line)
+    if m:
+        with progress_state["_lock"]:
+            progress_state["fps"] = float(m.group(1))
+
+
+def _write_running_report(report_path: str, task: str, progress_state: dict):
+    """Write a running-status report with progress info to the external report path."""
+    with progress_state["_lock"]:
+        cur_iter = progress_state["current_iteration"]
+        max_iter = progress_state["max_iterations"]
+        mean_reward = progress_state["mean_reward"]
+        fps = progress_state["fps"]
+        start_time = progress_state["_start_time"]
+
+    elapsed = time.time() - start_time
+    eta = None
+    percent = 0.0
+    if max_iter > 0 and cur_iter > 0:
+        percent = round(cur_iter / max_iter * 100, 1)
+        iter_per_sec = cur_iter / elapsed if elapsed > 0 else 0
+        if iter_per_sec > 0:
+            eta = round((max_iter - cur_iter) / iter_per_sec)
+
+    report = {
+        "status": "running",
+        "task": task,
+        "pid": os.getpid(),
+        "progress": {
+            "current_iteration": cur_iter,
+            "max_iterations": max_iter,
+            "percent_complete": percent,
+            "mean_reward": mean_reward,
+            "eta_seconds": eta,
+            "elapsed_seconds": round(elapsed),
+            "fps": fps,
+        },
+    }
+    try:
+        with open(report_path, "w") as f:
+            json.dump(report, f, indent=2)
+    except OSError:
+        pass  # don't crash if write fails
+
+
+def _validate_overrides_file(filepath: str) -> str | None:
+    """Validate an overrides JSON file. Returns error message or None if valid."""
+    if not os.path.isfile(filepath):
+        return f"File not found: {filepath}"
+    try:
+        with open(filepath) as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+
+    if not isinstance(data, dict):
+        return f"Expected a JSON object (dict), got {type(data).__name__}"
+
+    errors = []
+    for key, value in data.items():
+        # Check for common nested-dict mistake: {"env_cfg": {"key": val}}
+        if isinstance(value, dict):
+            errors.append(
+                f"  Key '{key}' has a dict value. Use flat dot-paths instead "
+                f"(e.g., \"{key}.subkey\": value, not \"{key}\": {{\"subkey\": value}})"
+            )
+        # Check for empty keys
+        if not key or not key.strip():
+            errors.append("  Found empty key in overrides")
+
+    if errors:
+        return "Override format errors:\n" + "\n".join(errors)
+    return None
+
+
+def _progress_writer(report_path: str, task: str, progress_state: dict, stop_event: threading.Event, interval: int = 30):
+    """Background thread: periodically writes progress to external report file."""
+    while not stop_event.wait(timeout=interval):
+        _write_running_report(report_path, task, progress_state)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run one auto-training phase.")
     # Task configuration
@@ -155,7 +253,10 @@ def main():
 
     # Play / video
     parser.add_argument("--video-length", type=int, default=300, help="Play video length in steps.")
-    parser.add_argument("--num-frames", type=int, default=8, help="Number of frames to extract from play video.")
+    parser.add_argument("--num-frames", type=int, default=12, help="Number of frames to extract from play video.")
+    parser.add_argument("--num-play-envs", type=int, default=4,
+                        help="Number of environments for play/video recording (default: 4). "
+                             "Use 2-4 for clear side-view video of individual robots.")
     parser.add_argument("--skip-play", action="store_true", default=False, help="Skip play and video extraction.")
 
     # Monitoring / abort criteria
@@ -188,15 +289,25 @@ def main():
         print(f"[INFO] Derived play task: {args.play_task}")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    cf_lab_dir = os.path.abspath(os.path.join(script_dir, "..", ".."))
+    # Script lives at .claude/skills/auto_train/resources/ — go up 4 levels to cf_lab root
+    cf_lab_dir = os.path.abspath(os.path.join(script_dir, "..", "..", "..", ".."))
+
+    # Shared progress state updated by stdout parser, read by progress writer
+    progress_state = {
+        "current_iteration": 0,
+        "max_iterations": args.max_iterations or 0,
+        "mean_reward": None,
+        "fps": None,
+        "_lock": threading.Lock(),
+        "_start_time": time.time(),
+    }
 
     # Write "running" marker so callers can poll for completion
     report_path_ext = None
     if args.report_path:
         report_path_ext = os.path.abspath(args.report_path)
         os.makedirs(os.path.dirname(report_path_ext) or ".", exist_ok=True)
-        with open(report_path_ext, "w") as f:
-            json.dump({"status": "running", "task": args.task, "pid": os.getpid()}, f, indent=2)
+        _write_running_report(report_path_ext, args.task, progress_state)
         print(f"[INFO] Status file: {report_path_ext}")
 
     start_time = time.time()
@@ -204,6 +315,24 @@ def main():
     status = "completed"
     early_stop_reason = None
     iterations_completed = None  # Will be resolved from metrics after training
+
+    # ── Pre-flight: validate overrides JSON ──
+    if args.overrides_file:
+        validation_error = _validate_overrides_file(args.overrides_file)
+        if validation_error:
+            status = "validation_error"
+            print(f"[ERROR] Override validation failed: {validation_error}")
+            if report_path_ext:
+                with open(report_path_ext, "w") as f:
+                    json.dump({"status": "validation_error", "error": validation_error, "task": args.task}, f, indent=2)
+            sys.exit(1)
+
+    # ── Pre-flight: validate resume path ──
+    if args.resume_from:
+        # Check if it looks like a full path instead of just a run folder name
+        if "/" in args.resume_from and not args.resume_from.startswith("logs"):
+            print(f"[WARNING] --resume-from should be just the run folder name (e.g., '2026-03-21_01-52-22'), "
+                  f"not a full path. Got: {args.resume_from}")
 
     # ── Step 1: Train ──
     print("=" * 60)
@@ -251,6 +380,17 @@ def main():
         finally:
             line_queue.put(None)  # sentinel: EOF
 
+    # Start progress writer thread if external report path is set
+    progress_stop = threading.Event()
+    progress_thread = None
+    if report_path_ext:
+        progress_thread = threading.Thread(
+            target=_progress_writer,
+            args=(report_path_ext, args.task, progress_state, progress_stop),
+            daemon=True,
+        )
+        progress_thread.start()
+
     if args.monitor_interval > 0 and (args.abort_plateau_patience or args.abort_min_reward_at or args.abort_episode_length_drop):
         # Monitoring mode: read output via thread, periodically check abort criteria
         print(f"[INFO] Monitoring enabled: checking every {args.monitor_interval}s")
@@ -270,6 +410,7 @@ def main():
                         eof = True
                         break
                     train_output_lines.append(line)
+                    parse_training_line(line, progress_state)
                     print(line)
                 except queue.Empty:
                     break
@@ -309,18 +450,26 @@ def main():
                 if line is None:
                     break
                 train_output_lines.append(line)
+                parse_training_line(line, progress_state)
                 print(line)
             except queue.Empty:
                 break
         reader_thread.join(timeout=5)
     else:
-        # No monitoring — just stream output
+        # No monitoring — stream output and parse progress
         for line in train_proc.stdout:
-            train_output_lines.append(line.rstrip())
-            print(line.rstrip())
+            stripped = line.rstrip()
+            train_output_lines.append(stripped)
+            parse_training_line(stripped, progress_state)
+            print(stripped)
 
     train_proc.wait()
     train_output = "\n".join(train_output_lines)
+
+    # Stop progress writer
+    progress_stop.set()
+    if progress_thread:
+        progress_thread.join(timeout=5)
 
     if train_proc.returncode != 0 and status != "early_stopped":
         status = "failed"
@@ -385,14 +534,13 @@ def main():
         checkpoint = find_latest_checkpoint(log_dir)
         if checkpoint:
             play_cmd = [
-                sys.executable, os.path.join(script_dir, "..", "rsl_rl", "play.py"),
+                sys.executable, os.path.join(script_dir, "play_for_inspection.py"),
                 f"--task={args.play_task}",
                 "--video",
                 f"--video_length={args.video_length}",
                 f"--checkpoint={checkpoint}",
+                f"--num_envs={args.num_play_envs}",
             ]
-            if args.num_envs is not None:
-                play_cmd.append(f"--num_envs={min(args.num_envs, 50)}")
             if args.headless:
                 play_cmd.append("--headless")
 
@@ -445,6 +593,32 @@ def main():
         with open(args.overrides_file) as f:
             overrides_applied = json.load(f)
 
+    # Extract convergence summary from metrics
+    convergence_summary = {}
+    suspicious_patterns = []
+    if metrics_data:
+        for term_name, term_data in metrics_data.get("reward_terms", {}).items():
+            shape = term_data.get("curve_shape", "")
+            if shape in ("converged_early", "degrading", "oscillating", "still_improving"):
+                convergence_summary[term_name] = {
+                    "curve_shape": shape,
+                    "converged_at_iteration": term_data.get("converged_at_iteration"),
+                    "percent_of_training_at_convergence": term_data.get("percent_of_training_at_convergence"),
+                    "final": term_data.get("final"),
+                }
+        # Also capture the main reward curve shape
+        for key in ("Train/mean_reward", "Train/reward"):
+            if key in metrics_data.get("scalars", {}):
+                sdata = metrics_data["scalars"][key]
+                convergence_summary["_mean_reward"] = {
+                    "curve_shape": sdata.get("curve_shape"),
+                    "converged_at_iteration": sdata.get("converged_at_iteration"),
+                    "percent_of_training_at_convergence": sdata.get("percent_of_training_at_convergence"),
+                    "final": sdata.get("final"),
+                }
+                break
+        suspicious_patterns = metrics_data.get("suspicious_patterns", [])
+
     report = {
         "status": status,
         "early_stop_reason": early_stop_reason,
@@ -454,8 +628,11 @@ def main():
         "iterations_completed": iterations_completed,
         "max_iterations": args.max_iterations,
         "num_envs": args.num_envs,
+        "num_play_envs": args.num_play_envs,
         "overrides_applied": overrides_applied,
         "metrics": metrics_data,
+        "convergence_summary": convergence_summary,
+        "suspicious_patterns": suspicious_patterns,
         "video_frames_dir": video_frames_dir,
         "frame_paths": frame_paths,
         "training_time_seconds": round(training_time, 1),
@@ -477,12 +654,38 @@ def main():
     if early_stop_reason:
         print(f"[DONE] Early stop reason: {early_stop_reason}")
 
+    # Print health summary for quick assessment
+    if metrics_data:
+        health_parts = []
+        # Total reward
+        for key in ("Train/mean_reward", "Train/reward"):
+            if key in metrics_data.get("scalars", {}):
+                s = metrics_data["scalars"][key]
+                conv = s.get("converged_at_iteration")
+                conv_str = f"converged@{conv}" if conv else s.get("curve_shape", "?")
+                mean_r = s.get("mean_last_100")
+                mean_r_str = f"{mean_r:.1f}" if isinstance(mean_r, (int, float)) else "?"
+                health_parts.append(f"reward: {mean_r_str} ({conv_str})")
+                break
+        # Velocity tracking terms
+        for term_name, term_data in metrics_data.get("reward_terms", {}).items():
+            if any(kw in term_name.lower() for kw in ("track_lin_vel", "track_ang_vel")):
+                val = term_data.get("mean_last_100", 0) or 0
+                shape = term_data.get("curve_shape", "?")
+                label = "vel_xy" if "lin" in term_name.lower() else "vel_yaw"
+                status_str = "BLOCKING" if val < 0.3 else ("NEEDS_WORK" if val < 0.6 else shape)
+                health_parts.append(f"{label}: {val:.3f} ({status_str})")
+        # Suspicious patterns count
+        health_parts.append(f"suspicious: {len(suspicious_patterns)}")
+        if health_parts:
+            print(f"[HEALTH] {' | '.join(health_parts)}")
+
 
 def main_safe():
     """Wrapper that guarantees the external report file reflects crashes."""
     try:
         main()
-    except Exception as e:
+    except BaseException as e:
         # If --report-path was given, write a crash report so the caller isn't stuck polling
         for arg in sys.argv:
             if arg.startswith("--report-path"):

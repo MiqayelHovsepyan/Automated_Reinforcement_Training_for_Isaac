@@ -6,7 +6,7 @@
 """Extract evenly-spaced frames from an MP4 video as PNG images.
 
 Usage:
-    python scripts/auto_train/extract_frames.py --video <path.mp4> --output-dir <dir> [--num-frames 8]
+    python .claude/skills/auto_train/resources/extract_frames.py --video <path.mp4> --output-dir <dir> [--num-frames 8]
 """
 
 import argparse
@@ -21,7 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description="Extract frames from video as PNG images.")
     parser.add_argument("--video", type=str, required=True, help="Path to MP4 video file.")
     parser.add_argument("--output-dir", type=str, required=True, help="Directory to save extracted frames.")
-    parser.add_argument("--num-frames", type=int, default=8, help="Number of frames to extract (default: 8).")
+    parser.add_argument("--num-frames", type=int, default=12, help="Number of frames to extract (default: 12).")
     args = parser.parse_args()
 
     video_path = os.path.abspath(args.video)

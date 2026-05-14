@@ -1,7 +1,7 @@
 ---
 name: auto_train
-description: Start an automated RL training loop for the AYG quadruped robot. Trains, evaluates visually, tunes, and repeats overnight.
-argument-hint: <task_name> level <1|2> on <device_info> [optional notes]
+description: Start an automated RL training loop for the AYG quadruped robot. Supports local and hybrid local/server (SSH) workflows. Trains, evaluates visually, tunes, and repeats overnight.
+argument-hint: <task_name> level <1|2> on <device_info> [--server=user@host:port --remote-path=/path/to/cf_lab] [optional notes]
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep, Agent
 model: opus
 effort: high
@@ -15,17 +15,92 @@ You are an expert RL engineer running an automated training loop for the AYG qua
 
 ## Setup
 
-1. Parse the arguments: extract task name, level (1 or 2), device info, and any additional notes. The user may include domain knowledge, known issues, focus areas, or hints (e.g., "robot tends to spider-walk", "previous best was 15.0", "focus on foot clearance"). Use these notes to guide your initial analysis and tuning strategy.
-2. `cd cf_lab` — all commands run from the cf_lab directory.
+1. Parse the arguments: extract task name, level (1 or 2), device info, and any additional notes. Check for `--server=user@host:port` and `--remote-path=/path/to/cf_lab` flags. If `--server` is present, enable **remote mode** (training on server via SSH, play/analysis locally). Parse the server argument into `$SSH_USER_HOST` (e.g., `root@79.117.54.182`) and `$SSH_PORT` (e.g., `19779`). If no port is specified, default to `22`. Set `$REMOTE_CF_LAB` from `--remote-path`. If `--server` is absent, use **local mode** (all local, unchanged behavior). The user may include domain knowledge, known issues, focus areas, or hints (e.g., "robot tends to spider-walk", "previous best was 15.0", "focus on foot clearance"). Use these notes to guide your initial analysis and tuning strategy.
+2. `cd cf_lab` — all commands run from the cf_lab directory. Set `$LOCAL_CF_LAB` to this absolute path.
 3. Ensure dependencies: `source .venv/bin/activate && uv pip install tbparse opencv-python-headless`
 4. Ensure directories: `mkdir -p .claude/skills/auto_train/experiments/.scratch`
 5. Read the task's env config to fully understand all reward terms, weights, observations, terminations, curriculum, and PPO hyperparams before making any changes. You must know the full reward structure as an RL expert before touching anything.
+6. **(Remote mode only)** Perform one-time remote setup — see Remote Mode section below.
 
 ## Levels
 
 **Level 1 — Reward Tuning:** Change reward weights and PPO hyperparams via JSON overrides. No source files edited. Safe and reversible.
 
 **Level 2 — Overall Training Tuning:** Full autonomy — add/remove rewards, terminations, observations, write new reward functions, staged curriculum. Source config files are edited directly on the current branch.
+
+## Remote Mode (Hybrid Local/Server Workflow)
+
+When `--server` and `--remote-path` are provided, training runs on the remote server (GPU, no display), while play, frame extraction, metrics reading, and visual inspection run locally (Isaac Sim + rendering). **If `--server` is absent, skip this entire section — everything runs locally as before.**
+
+**Requirements:**
+- SSH key-based authentication configured (no password prompts — required for unattended mode)
+- The remote server has cf_lab set up with a working `.venv/` and GPU
+- The local machine has Isaac Sim + cf_lab fully set up with rendering capability
+- Both machines have the same task registered (same `cf_lab` package)
+
+**Variables (set once in setup, used throughout):**
+- `$SSH_USER_HOST` — e.g., `root@79.117.54.182`
+- `$SSH_PORT` — e.g., `19779`
+- `$REMOTE_CF_LAB` — absolute path to cf_lab on the server, e.g., `/workspace/cf_lab`
+- `$LOCAL_CF_LAB` — absolute path to cf_lab locally (the cwd after step 2)
+
+### Two rsync Commands (Push and Pull)
+
+All file transfer uses these two patterns:
+
+**Push local → server** (before each training run — syncs everything except logs/venv/.git):
+```bash
+rsync -avz --progress -e "ssh -p $SSH_PORT" \
+    --exclude='.git' --exclude='__pycache__' --exclude='.venv' --exclude='logs' \
+    $LOCAL_CF_LAB/ \
+    $SSH_USER_HOST:$REMOTE_CF_LAB/
+```
+This syncs everything in one command: override JSONs in `.claude/skills/auto_train/experiments/.scratch/`, auto_train resource scripts, source config edits (Level 2), task definitions.
+
+**Pull logs server → local** (after training completes):
+```bash
+rsync -avz --progress -e "ssh -p $SSH_PORT" \
+    $SSH_USER_HOST:$REMOTE_CF_LAB/logs/ \
+    $LOCAL_CF_LAB/logs/
+```
+This brings all new training logs: checkpoints, TensorBoard events, metrics.json, phase_report.json — everything needed for local play and analysis.
+
+### One-Time Remote Setup (per session)
+
+Perform these steps once at the start of a remote-mode session (setup step 6):
+
+1. **Test SSH connectivity:**
+   ```bash
+   ssh -p $SSH_PORT -o BatchMode=yes -o ConnectTimeout=10 $SSH_USER_HOST "echo 'SSH OK'"
+   ```
+   If this fails, stop immediately. SSH key auth must be working.
+
+2. **Verify server venv:**
+   ```bash
+   ssh -p $SSH_PORT $SSH_USER_HOST "ls $REMOTE_CF_LAB/.venv/bin/python"
+   ```
+
+3. **Ensure tbparse on server** (needed by `analyze_metrics.py` which runs as part of `run_phase.py`):
+   ```bash
+   ssh -p $SSH_PORT $SSH_USER_HOST "cd $REMOTE_CF_LAB && .venv/bin/python -c 'import tbparse; print(\"tbparse OK\")'" 2>&1
+   ```
+   If missing: `ssh -p $SSH_PORT $SSH_USER_HOST "cd $REMOTE_CF_LAB && source .venv/bin/activate && uv pip install tbparse"`
+
+4. **Initial push** to sync auto_train scripts and configs to server:
+   ```bash
+   rsync -avz --progress -e "ssh -p $SSH_PORT" \
+       --exclude='.git' --exclude='__pycache__' --exclude='.venv' --exclude='logs' \
+       $LOCAL_CF_LAB/ \
+       $SSH_USER_HOST:$REMOTE_CF_LAB/
+   ```
+
+### Remote Mode Error Handling
+
+- **SSH failure** → stop, report error. Cannot proceed without SSH.
+- **rsync push failure** → retry once. Do NOT train on stale server state.
+- **rsync pull failure** → retry once. Verify `phase_report.json` exists locally before proceeding to play.
+- **SSH drop during wait** → training survives (detached via `nohup setsid`). Reconnect and check report status. Re-run wait if still running.
+- **Server disk check** before each training run: `ssh -p $SSH_PORT $SSH_USER_HOST "df -h $REMOTE_CF_LAB | tail -1"`. If <10 GB free, stop and log warning.
 
 ## Override JSON Format
 
@@ -55,6 +130,7 @@ Override files use **flat dot-paths** as keys. The values are applied directly t
 
 ## How it works
 
+**Local mode:**
 1. Claude reads the task's env config to discover all reward terms, weights, observations, terminations, and PPO hyperparams
 2. Performs the Pre-Training Body Coverage Audit and Pre-Training Reward Analysis
 3. Writes override JSON to `.claude/skills/auto_train/experiments/.scratch/`
@@ -66,6 +142,13 @@ Override files use **flat dot-paths** as keys. The values are applied directly t
 9. Logs everything in `.claude/skills/auto_train/experiments/<name>/journal.md` using the Enhanced Journal Format
 10. Repeats until the Production Readiness Checklist passes (minimum 5 successful tuning iterations), then runs a final production training with high iterations
 11. Bakes winning weights into source config
+
+**Remote mode** — same steps, but step 4–6 change:
+4. Pushes local changes to server (rsync push), then launches `run_phase.py --skip-play` on the server via SSH (detached via `nohup setsid`)
+5. Waits for completion via SSH using `wait_for_phase.py` on the server
+6. Pulls training logs from server (rsync pull), then runs `play_for_inspection.py` and `extract_frames.py` locally, then reads `phase_report.json` (metrics) + PNG frames (visual)
+
+All other steps (1–3, 7–11) run locally in both modes. See the Auto-Train Loop section for exact commands.
 
 ## Pre-Training Body Coverage Audit (MANDATORY before iteration 1)
 
@@ -215,7 +298,10 @@ For each iteration:
 
 1. **Reason** — Based on previous results (or initial analysis for iteration 1), decide what to change and why. Think like an expert RL engineer. **Change ONE variable per iteration** (or a clearly independent group). State your hypothesis and which variable is being tested. Exception: iteration 1 can batch obvious fixes identified in the pre-training analysis. For iteration counts: use **300–500 iterations for tuning runs**. State in the journal WHY you chose the specific count. See Tuning Strategy section.
 2. **Write overrides** — Save override JSON to `.claude/skills/auto_train/experiments/.scratch/`.
-3. **Run phase** — Launch `run_phase.py` as a detached process so it survives any timeout. Use this exact pattern:
+
+3. **Run phase** — Launch training as a detached process so it survives any timeout.
+
+   **Local mode:**
    ```bash
    nohup setsid .venv/bin/python .claude/skills/auto_train/resources/run_phase.py \
      --task=<TASK> --max-iterations=<N> --num-envs=<N> --headless \
@@ -224,29 +310,103 @@ For each iteration:
      --monitor-interval=60 --abort-min-reward-at=300:-10 --abort-plateau-patience=500 \
      > .claude/skills/auto_train/experiments/.scratch/current_phase.log 2>&1 &
    ```
+
+   **Remote mode:** First push local changes to server (overrides, scripts, and any Level 2 source edits):
+   ```bash
+   rsync -avz --progress -e "ssh -p $SSH_PORT" \
+       --exclude='.git' --exclude='__pycache__' --exclude='.venv' --exclude='logs' \
+       $LOCAL_CF_LAB/ \
+       $SSH_USER_HOST:$REMOTE_CF_LAB/
+   ```
+   Then SSH to server and launch `run_phase.py` with `--skip-play` (server has no rendering):
+   ```bash
+   ssh -p $SSH_PORT $SSH_USER_HOST "cd $REMOTE_CF_LAB && \
+     export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 && \
+     nohup setsid .venv/bin/python .claude/skills/auto_train/resources/run_phase.py \
+       --task=<TASK> --max-iterations=<N> --num-envs=<N> --headless \
+       --skip-play \
+       --overrides-file=.claude/skills/auto_train/experiments/.scratch/<file>.json \
+       --report-path=.claude/skills/auto_train/experiments/.scratch/current_phase_report.json \
+       --monitor-interval=60 --abort-min-reward-at=300:-10 --abort-plateau-patience=500 \
+       > .claude/skills/auto_train/experiments/.scratch/current_phase.log 2>&1 &"
+   ```
+   The `ssh` command returns immediately because the process is detached on the server.
+
    **IMPORTANT:** Always use `.venv/bin/python`, never bare `python`. Each Bash call starts a fresh shell — venv activation from earlier steps does not persist. The `.venv/bin/python` ensures the correct Python (with Isaac Lab, tbparse, etc.) is used. `run_phase.py` uses `sys.executable` for all subprocesses (training, play, metrics), so the venv propagates automatically.
 
    **Abort criteria:** Always include `--monitor-interval=60` and at least `--abort-min-reward-at=300:-10` for tuning runs. This catches obviously broken runs early and saves compute. For production runs, use looser thresholds or omit abort criteria.
 
-4. **Wait for completion** — Use the blocking wait script instead of polling:
+4. **Wait for completion** — Use the blocking wait script instead of polling.
+
+   **Local mode:**
    ```bash
    .venv/bin/python .claude/skills/auto_train/resources/wait_for_phase.py \
      --report-path=.claude/skills/auto_train/experiments/.scratch/current_phase_report.json \
      --poll-interval=30 --timeout=7200
    ```
+
+   **Remote mode:**
+   ```bash
+   ssh -p $SSH_PORT -o ServerAliveInterval=30 -o ServerAliveCountMax=120 $SSH_USER_HOST \
+     "cd $REMOTE_CF_LAB && .venv/bin/python .claude/skills/auto_train/resources/wait_for_phase.py \
+       --report-path=.claude/skills/auto_train/experiments/.scratch/current_phase_report.json \
+       --poll-interval=30 --timeout=7200"
+   ```
+   The `-o ServerAliveInterval=30 -o ServerAliveCountMax=120` keeps the SSH connection alive during long training runs.
+
    Use `timeout: 7500000` on the Bash tool call (slightly over 2 hours). The script blocks internally and prints progress to stderr. When training completes, it prints the full report JSON to stdout and exits.
 
    **First check at 60s:** Before using `wait_for_phase.py`, do one quick check after 60 seconds to catch fast failures (validation errors, import errors, OOM):
+
+   Local mode:
    ```bash
    sleep 55 && cat .claude/skills/auto_train/experiments/.scratch/current_phase_report.json
+   ```
+   Remote mode:
+   ```bash
+   sleep 55 && ssh -p $SSH_PORT $SSH_USER_HOST "cat $REMOTE_CF_LAB/.claude/skills/auto_train/experiments/.scratch/current_phase_report.json"
    ```
    If status is `"validation_error"`, `"crashed"`, or `"failed"`, skip the wait and proceed to analysis. If `"running"`, use `wait_for_phase.py` for the rest.
 
    **Terminal statuses:** `"completed"`, `"early_stopped"`, `"failed"`, `"crashed"`, `"validation_error"` — proceed to analysis.
 
-   **Dead process detection:** The report file contains a `"pid"` field. If the file says `"running"` but `kill -0 <PID>` fails, treat it as a crash.
+   **Dead process detection:** The report file contains a `"pid"` field. If the file says `"running"` but `kill -0 <PID>` fails (remote mode: `ssh -p $SSH_PORT $SSH_USER_HOST "kill -0 <PID>"`), treat it as a crash.
 
-5. **Analyze** — Read the full `phase_report.json` (from the `log_dir` field in the report) for detailed metrics following the TensorBoard Analysis Protocol. Read extracted PNG frames following the Visual Inspection Protocol. Then check:
+   **SSH drop recovery (remote mode):** If SSH drops during the wait, the training process on the server survives (detached via `nohup setsid`). Reconnect and check the report file:
+   ```bash
+   ssh -p $SSH_PORT $SSH_USER_HOST "cat $REMOTE_CF_LAB/.claude/skills/auto_train/experiments/.scratch/current_phase_report.json"
+   ```
+   If status is still `"running"`, re-run the blocking wait command. If terminal, proceed to step 5.
+
+5. **Analyze** — Get the results and perform analysis.
+
+   **Remote mode only — pull logs from server before analysis:**
+   ```bash
+   rsync -avz --progress -e "ssh -p $SSH_PORT" \
+       $SSH_USER_HOST:$REMOTE_CF_LAB/logs/ \
+       $LOCAL_CF_LAB/logs/
+   ```
+   This brings checkpoints, TensorBoard events, metrics.json, and phase_report.json to local.
+
+   **Remote mode only — run play and extract frames locally:**
+   The phase_report.json from the server will have `"frame_paths": []` because `--skip-play` was used. Determine the local log directory from the report's `"log_dir"` field (convert the server absolute path to local by replacing `$REMOTE_CF_LAB` with `$LOCAL_CF_LAB`). Then run play and frame extraction locally:
+   ```bash
+   nohup setsid .venv/bin/python .claude/skills/auto_train/resources/play_for_inspection.py \
+     --task=<PLAY_TASK> \
+     --checkpoint=$LOCAL_LOG_DIR/<latest_model>.pt \
+     --video --video_length=300 --headless --num_envs=4 \
+     > /dev/null 2>&1 &
+   ```
+   Wait for play to finish (it takes ~1-2 minutes), then extract frames:
+   ```bash
+   .venv/bin/python .claude/skills/auto_train/resources/extract_frames.py \
+     --video=$LOCAL_LOG_DIR/videos/play/<video>.mp4 \
+     --output-dir=$LOCAL_LOG_DIR/frames \
+     --num-frames=12
+   ```
+   The play task ID is derived from the training task: replace `-v0` with `-Play-v0` (e.g., `Isaac-Velocity-Flat-Ayg-v0` → `Isaac-Velocity-Flat-Ayg-Play-v0`).
+
+   **Both modes:** Read the full `phase_report.json` (from the local `log_dir`) for detailed metrics following the TensorBoard Analysis Protocol. Read extracted PNG frames following the Visual Inspection Protocol. Then check:
 
    **Velocity Tracking Gate:**
    - Velocity tracking reward (exp-kernel) below **0.3** after 300+ iterations → **BLOCKING problem**. Do not proceed to other tuning — your next iteration MUST address velocity tracking (increase weight, decrease competing penalties, check command ranges).
@@ -343,6 +503,12 @@ Each auto-train session logs to `.claude/skills/auto_train/experiments/<experime
 ```
 # Auto-Train: <task_name>
 Started: <date>  |  Level: <1|2>  |  Device: <device_info>
+```
+In remote mode, add the server info:
+```
+# Auto-Train: <task_name>
+Started: <date>  |  Level: <1|2>  |  Device: <device_info>
+Mode: Remote  |  Server: <user@host:port>  |  Remote cf_lab: <remote_path>
 ```
 
 **Body Coverage Audit** (written once, before iteration 1):
@@ -472,7 +638,7 @@ Use GPU model and VRAM to choose appropriate `num_envs` and iteration counts:
 ## Key Rules
 
 - **Always visually inspect honestly** — The robot can maximize reward while hip-walking or crawling. Follow the Visual Inspection Protocol. State what you CAN and CANNOT verify from the camera angle. Never claim good gait quality you cannot actually confirm.
-- **Never skip play** — Do not use `--skip-play`.
+- **Never skip play** — In local mode, do not use `--skip-play`. In remote mode, use `--skip-play` on the server (no rendering capability), then run play LOCALLY after pulling logs. Play must always happen — just not necessarily on the same machine as training.
 - **Scale to device** — Use the device info to choose `num_envs` and iteration counts appropriately.
 - **Start conservative with short runs** — First iteration should be a baseline or small change at 300–500 iterations. Do NOT use 2000 iterations for tuning.
 - **One variable per iteration** — Change one thing at a time so you can attribute results. State your hypothesis in the journal.
@@ -497,6 +663,8 @@ Auto-train is designed to run unattended (e.g., overnight with `claude --dangero
 - **Detached launch** — Always launch `run_phase.py` via `nohup setsid ... &` (as shown in the Auto-Train Loop section). NEVER use `run_in_background: true` — it has a timeout that kills long training runs. The `nohup setsid` approach fully detaches the process.
 - **Disk awareness** — Each iteration produces checkpoints (~50-200 MB) and videos. If running many iterations, note cumulative disk usage in the journal. If `df -h` shows <10 GB free on the training partition at any check, stop and log a warning.
 - **Level 2 safety** — Before starting a new training after editing source files, verify the edit is syntactically valid: `.venv/bin/python -c "import ast; ast.parse(open('<edited_file>').read()); print('syntax OK')"`. If this fails, fix the error before training. Note: do NOT use `import cf_lab.tasks` as a check — it requires Isaac Sim runtime and will always fail in a plain shell.
+- **SSH resilience (remote mode)** — Always use `-p $SSH_PORT` on every SSH and rsync command. Use `-o ServerAliveInterval=30 -o ServerAliveCountMax=120` on long-running SSH sessions (wait_for_phase.py). Training on the server is detached via `nohup setsid` and survives SSH disconnects. Never consider a dropped SSH connection as a training failure — always reconnect and check the actual report file status.
+- **Rsync verification (remote mode)** — After pulling logs from the server, verify that `phase_report.json` and at least one checkpoint file exist locally before proceeding to play. If rsync was interrupted, retry once. Do not run play on incomplete data.
 
 ## Environment Variables (always set before training)
 
@@ -510,6 +678,8 @@ The auto-train system is self-contained in a single folder. To enable it on any 
 1. Copy `.claude/skills/auto_train/` folder into that branch's `.claude/skills/`
 
 That's it. The skill handles setup (dependencies, directories) automatically on first run.
+
+For remote mode, the push rsync command syncs auto_train scripts to the server automatically before each training run. No manual setup on the server is needed beyond having cf_lab + `.venv` working.
 
 ---
 
